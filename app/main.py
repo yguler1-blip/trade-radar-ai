@@ -1,40 +1,41 @@
+# app/main.py
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
-import time, math, os, statistics
-import requests
+import time, math, os, requests
+from datetime import datetime, timezone
 
-app = FastAPI(title="Trade Radar (MVP+)")
+app = FastAPI(title="Trade Radar (MVP+) — Yiğit Mode")
 
-# ---------------------------
-# CONFIG
-# ---------------------------
-CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "60"))
-TOP_PICKS = int(os.getenv("TOP_PICKS", "10"))
+# =========================
+# Config
+# =========================
+CACHE_TTL = int(os.getenv("CACHE_TTL", "30"))  # seconds
+VOL_MIN_USD = int(os.getenv("VOL_MIN_USD", "60000000"))  # default 60M
+PCT_MIN = float(os.getenv("PCT_MIN", "2"))  # 24h abs% min
+PCT_MAX = float(os.getenv("PCT_MAX", "25"))  # 24h abs% max
+TOP_N = int(os.getenv("TOP_N", "10"))
 
-MIN_VOL_USD = float(os.getenv("MIN_VOL_USD", "60000000"))   # 60M/day
-MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "0.00001"))
+WHALE_THRESHOLD_USD = float(os.getenv("WHALE_THRESHOLD_USD", "750000"))  # $750k
+WHALE_LOOKBACK_TRADES = int(os.getenv("WHALE_LOOKBACK_TRADES", "60"))  # aggTrades limit
 
-MAX_ABS_24H = float(os.getenv("MAX_ABS_24H", "25"))         # pump killer
-MIN_ABS_24H = float(os.getenv("MIN_ABS_24H", "2.0"))
-
-WHALE_TTL_SEC = int(os.getenv("WHALE_TTL_SEC", "30"))
-WHALE_LOOKBACK_TRADES = int(os.getenv("WHALE_LOOKBACK_TRADES", "80"))
-WHALE_NOTIONAL_USD = float(os.getenv("WHALE_NOTIONAL_USD", "750000"))
+# Prefer Binance mirror to avoid 451 in some regions
+BINANCE_ENDPOINTS = [
+    os.getenv("BINANCE_BASE", "").strip(),
+    "https://data-api.binance.vision",
+    "https://api1.binance.com",
+    "https://api2.binance.com",
+    "https://api3.binance.com",
+    "https://api.binance.com",
+]
+BINANCE_ENDPOINTS = [x for x in BINANCE_ENDPOINTS if x]
 
 USER_AGENT = {"User-Agent": "trade-radar-mvp-plus"}
 
-STABLE_SKIP = {
-    "USDT","USDC","DAI","BUSD","TUSD","USDE","USD1","FDUSD","EURT","USDP","PYUSD","FRAX"
-}
 
-_cache_top = {"ts": 0, "data": None}
-_cache_whales = {"ts": 0, "data": None}
-
-# ---------------------------
-# HELPERS
-# ---------------------------
-def now() -> int:
-    return int(time.time())
+# =========================
+# Helpers
+# =========================
+_cache = {"ts": 0, "data": None}
 
 def clamp(x, lo, hi):
     return max(lo, min(hi, x))
@@ -45,6 +46,22 @@ def safe_float(x, default=0.0):
     except Exception:
         return default
 
+def now_ts():
+    return int(time.time())
+
+def fmt_usd(n):
+    try:
+        n = float(n)
+    except:
+        return str(n)
+    if n >= 1e9:
+        return f"{n/1e9:.2f}B"
+    if n >= 1e6:
+        return f"{n/1e6:.2f}M"
+    if n >= 1e3:
+        return f"{n/1e3:.2f}K"
+    return f"{n:.2f}"
+
 def http_get_json(url, params=None, timeout=20, headers=None):
     h = dict(USER_AGENT)
     if headers:
@@ -53,411 +70,396 @@ def http_get_json(url, params=None, timeout=20, headers=None):
     r.raise_for_status()
     return r.json()
 
-def score_coin(p24, vol24_usd, spread_pct=0.002, market_gate="NEUTRAL"):
-    # momentum
-    p24c = clamp(p24, -18.0, 22.0)
-    momentum = clamp((p24c + 18.0) / 40.0 * 100.0, 0, 100)
+def http_get_json_with_fallback(path, params=None, timeout=20):
+    last_err = None
+    for base in BINANCE_ENDPOINTS:
+        try:
+            url = base.rstrip("/") + path
+            return http_get_json(url, params=params, timeout=timeout)
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err
 
-    # liquidity
-    vol = max(vol24_usd, 1.0)
-    liq = clamp((math.log10(vol) - 7.5) / (10.0 - 7.5) * 100.0, 0, 100)
 
-    # spread score (rough)
-    spread = clamp((0.010 - spread_pct) / (0.010 - 0.001) * 100.0, 0, 100)
+# =========================
+# Scoring / Plan
+# =========================
+def score_coin(p24, vol24_usd, spread_hint=0.002):
+    """
+    score 0-100: momentum + liquidity + low-spread hint.
+    This is MVP logic, not financial advice.
+    """
+    # momentum: clamp -20..40
+    p24c = clamp(p24, -20.0, 40.0)
+    m = (p24c + 20.0) / 60.0 * 100.0
+    # penalize insane spikes
+    if p24 > 120:
+        m -= 40
+    elif p24 > 60:
+        m -= 20
+    m = clamp(m, 0, 100)
 
-    base = 0.35 * momentum + 0.50 * liq + 0.15 * spread
+    # liquidity: log scale 1M..100M..10B
+    v = clamp((math.log10(max(vol24_usd, 1.0)) - 6.0) / (10.0 - 6.0) * 100.0, 0, 100)
 
-    if market_gate in ("BEARISH", "PANIC"):
-        base -= 6.0
-        if p24 > 8:
-            base -= 4.0
+    # spread hint: prefer <0.8%
+    s = clamp((0.008 - spread_hint) / (0.008 - 0.0005) * 100.0, 0, 100)
 
+    base = 0.45 * m + 0.40 * v + 0.15 * s
     return round(clamp(base, 0, 100), 1)
 
-def build_trade_plan(price):
-    # very simple plan; later ATR ekleriz
-    stop = price * 0.975
-    tp1 = price * 1.03
-    tp2 = price * 1.055
-    return {"entry": round(price, 8), "stop": round(stop, 8), "tp1": round(tp1, 8), "tp2": round(tp2, 8)}
+def build_trade_plan(last_price):
+    # Simple risk template
+    entry = last_price
+    stop = last_price * 0.97
+    tp1  = last_price * 1.04
+    tp2  = last_price * 1.07
+    return {
+        "entry": round(entry, 8),
+        "stop": round(stop, 8),
+        "tp1": round(tp1, 8),
+        "tp2": round(tp2, 8),
+    }
 
-def compute_market_mode(rows_sorted_by_vol):
-    by_sym = {r["symbol"]: r for r in rows_sorted_by_vol}
-    btc = by_sym.get("BTC")
-    eth = by_sym.get("ETH")
-    btc_chg = safe_float(btc["chg24_pct"]) if btc else 0.0
-    eth_chg = safe_float(eth["chg24_pct"]) if eth else 0.0
 
-    top20 = rows_sorted_by_vol[:20] if len(rows_sorted_by_vol) >= 20 else rows_sorted_by_vol
-    median20 = statistics.median([safe_float(x["chg24_pct"]) for x in top20]) if top20 else 0.0
-
-    idx = 0.5 * btc_chg + 0.3 * eth_chg + 0.2 * median20
-
-    if idx > 1.2:
-        mode = "STRONG BULLISH"
-        gate = "BULLISH"
-    elif idx > 0.4:
-        mode = "BULLISH"
-        gate = "BULLISH"
-    elif idx < -1.2:
-        mode = "PANIC"
-        gate = "PANIC"
-    elif idx < -0.4:
-        mode = "BEARISH"
-        gate = "BEARISH"
-    else:
-        mode = "NEUTRAL"
-        gate = "NEUTRAL"
-
-    return mode, gate, round(idx, 2), round(btc_chg, 2), round(eth_chg, 2), round(median20, 2)
-
-def explain_pick(p24, vol24):
-    reasons = []
-    if vol24 >= 300_000_000:
-        reasons.append("çok yüksek likidite")
-    elif vol24 >= 120_000_000:
-        reasons.append("yüksek likidite")
-
-    if p24 >= 6:
-        reasons.append("güçlü momentum")
-    elif p24 >= 3:
-        reasons.append("pozitif momentum")
-    else:
-        reasons.append("ılımlı hareket")
-
-    return ", ".join(reasons)
-
-# ---------------------------
-# BINANCE DATA
-# ---------------------------
+# =========================
+# Binance fetchers
+# =========================
 def fetch_binance_24h_all():
-    # NOTE: This is the workhorse. With caching we avoid 429.
-    url = "https://api.binance.com/api/v3/ticker/24hr"
-    data = http_get_json(url, timeout=25)
-    return data if isinstance(data, list) else []
+    # GET /api/v3/ticker/24hr
+    return http_get_json_with_fallback("/api/v3/ticker/24hr", timeout=25)
 
 def fetch_binance_agg_trades(symbol, limit=WHALE_LOOKBACK_TRADES):
+    # GET /api/v3/aggTrades?symbol=BTCUSDT&limit=...
     pair = f"{symbol}USDT"
-    url = "https://api.binance.com/api/v3/aggTrades"
     params = {"symbol": pair, "limit": limit}
-    return http_get_json(url, params=params, timeout=20)
+    return http_get_json_with_fallback("/api/v3/aggTrades", params=params, timeout=20)
 
-# ---------------------------
-# TOP PICKS (BINANCE ONLY)
-# ---------------------------
-def get_top_picks_cached():
-    if _cache_top["data"] and (now() - _cache_top["ts"] < CACHE_TTL_SEC):
-        return _cache_top["data"]
 
-    source = "binance"
-    warning = None
+# =========================
+# Core logic
+# =========================
+def compute_market_mode(btc_pct, eth_pct):
+    # very rough regime:
+    # index is average of BTC+ETH 24h
+    idx = (btc_pct + eth_pct) / 2.0
+    if idx > 1.0:
+        return "BULLISH", round(idx, 2)
+    if idx < -1.0:
+        return "BEARISH", round(idx, 2)
+    return "NEUTRAL", round(idx, 2)
 
-    rows_all = []
-    try:
-        data = fetch_binance_24h_all()
-    except Exception as e:
-        payload = {
-            "ts": now(),
-            "source": source,
-            "market_mode": "UNKNOWN",
-            "market_gate": "UNKNOWN",
-            "market_index": 0,
-            "btc_24h": 0,
-            "eth_24h": 0,
-            "median20_24h": 0,
-            "top_picks": [],
-            "config": {
-                "whale_threshold_usd": int(WHALE_NOTIONAL_USD),
-                "min_vol_usd": int(MIN_VOL_USD),
-                "min_abs_24h": MIN_ABS_24H,
-                "max_abs_24h": MAX_ABS_24H,
-            },
-            "warning": f"Binance fetch failed: {repr(e)}"
-        }
-        _cache_top["ts"] = now()
-        _cache_top["data"] = payload
-        return payload
+def build_top_picks_from_binance(tickers):
+    """
+    tickers: list of dicts from /ticker/24hr
+    Use: quoteVolume (USDT), lastPrice, priceChangePercent
+    Filter: USDT pairs, exclude stablecoins + weird leveraged tokens
+    """
+    exclude = set([
+        "USDT", "USDC", "BUSD", "TUSD", "FDUSD", "DAI",
+        "EUR", "TRY", "BRL", "GBP", "AUD", "RUB", "UAH",
+    ])
+    # exclude common leveraged suffixes
+    bad_suffixes = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
 
-    # filter USDT pairs only, ignore leveraged tokens, ignore stables
-    for x in data:
-        sym_pair = (x.get("symbol") or "")
-        if not sym_pair.endswith("USDT"):
+    rows = []
+    for t in tickers:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT"):
             continue
-        base = sym_pair[:-4]  # remove USDT
-
-        if not base or base in STABLE_SKIP:
-            continue
-        if "UP" in base or "DOWN" in base or base.endswith("BULL") or base.endswith("BEAR"):
+        if sym.endswith(bad_suffixes):
             continue
 
-        last_price = safe_float(x.get("lastPrice"))
-        quote_vol = safe_float(x.get("quoteVolume"))  # already in quote (USDT) -> USD-ish
-        p24 = safe_float(x.get("priceChangePercent"))
-
-        if last_price <= 0 or quote_vol <= 0:
+        base = sym[:-4]  # remove USDT
+        if base in exclude:
             continue
 
-        rows_all.append({
+        last = safe_float(t.get("lastPrice"))
+        p24 = safe_float(t.get("priceChangePercent"))
+        qv = safe_float(t.get("quoteVolume"))  # in USDT
+        if last <= 0:
+            continue
+
+        # filters (abs change between PCT_MIN..PCT_MAX, volume >= VOL_MIN_USD)
+        if qv < VOL_MIN_USD:
+            continue
+
+        ap24 = abs(p24)
+        if ap24 < PCT_MIN or ap24 > PCT_MAX:
+            continue
+
+        score = score_coin(p24=p24, vol24_usd=qv, spread_hint=0.002)
+
+        rows.append({
             "symbol": base,
-            "pair": sym_pair,
-            "price": last_price,
-            "chg24_pct": p24,
-            "vol24_usd": quote_vol
-        })
-
-    # market mode calc from top volume
-    rows_by_vol = sorted(rows_all, key=lambda r: r["vol24_usd"], reverse=True)
-    market_mode, gate, market_index, btc24, eth24, median20 = compute_market_mode(rows_by_vol)
-
-    # tradeable filter + score
-    tradeable = []
-    for r in rows_all:
-        price = r["price"]
-        vol24 = r["vol24_usd"]
-        p24 = r["chg24_pct"]
-
-        if price < MIN_PRICE_USD:
-            continue
-        if vol24 < MIN_VOL_USD:
-            continue
-        if abs(p24) > MAX_ABS_24H:
-            continue
-        if abs(p24) < MIN_ABS_24H:
-            continue
-
-        score = score_coin(p24=p24, vol24_usd=vol24, market_gate=gate)
-        tradeable.append({
-            "symbol": r["symbol"],
-            "price": round(price, 6),
+            "pair": sym,
+            "price": round(last, 8),
             "chg24_pct": round(p24, 2),
-            "vol24_usd": int(vol24),
+            "vol24_usdt": int(qv),
             "score": score,
-            "plan": build_trade_plan(price),
-            "why": explain_pick(p24, vol24)
+            "plan": build_trade_plan(last),
         })
 
-    tradeable.sort(key=lambda r: r["score"], reverse=True)
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    return rows[:TOP_N]
 
-    payload = {
-        "ts": now(),
-        "source": source,
-        "market_mode": market_mode,
-        "market_gate": gate,
-        "market_index": market_index,
-        "btc_24h": btc24,
-        "eth_24h": eth24,
-        "median20_24h": median20,
-        "top_picks": tradeable[:TOP_PICKS],
-        "config": {
-            "whale_threshold_usd": int(WHALE_NOTIONAL_USD),
-            "min_vol_usd": int(MIN_VOL_USD),
-            "min_abs_24h": MIN_ABS_24H,
-            "max_abs_24h": MAX_ABS_24H,
-        }
-    }
-    if warning:
-        payload["warning"] = warning
-
-    _cache_top["ts"] = now()
-    _cache_top["data"] = payload
-    return payload
-
-# ---------------------------
-# WHALES
-# ---------------------------
-def get_whales_cached():
-    if _cache_whales["data"] and (now() - _cache_whales["ts"] < WHALE_TTL_SEC):
-        return _cache_whales["data"]
-
-    top = get_top_picks_cached()
-    picks = (top.get("top_picks") or [])
-    symbols = [x["symbol"] for x in picks][:7]
-
+def build_whale_alerts(picks, threshold_usd=WHALE_THRESHOLD_USD):
+    """
+    For each pick, pull recent aggTrades and detect any single trade above threshold.
+    Approx value = price * quantity (q)
+    """
     alerts = []
-    for s in symbols:
+    for p in picks[:min(6, len(picks))]:  # limit to reduce rate / latency
+        sym = p["symbol"]
+        price = float(p["price"])
         try:
-            trades = fetch_binance_agg_trades(s, limit=WHALE_LOOKBACK_TRADES)
-            for t in trades:
-                price = safe_float(t.get("p"))
-                qty = safe_float(t.get("q"))
-                ts = int(t.get("T", 0) / 1000) if t.get("T") else 0
-                notional = price * qty
-                if notional >= WHALE_NOTIONAL_USD:
+            trades = fetch_binance_agg_trades(sym, limit=WHALE_LOOKBACK_TRADES)
+            for tr in trades:
+                qty = safe_float(tr.get("q"))
+                is_buyer_maker = tr.get("m", False)  # True means sell-side aggressor
+                usd = qty * price
+                if usd >= threshold_usd:
+                    ts_ms = int(tr.get("T", 0))
+                    dt = datetime.fromtimestamp(ts_ms/1000, tz=timezone.utc).astimezone()
+                    side = "SELL" if is_buyer_maker else "BUY"
                     alerts.append({
-                        "symbol": s,
-                        "pair": f"{s}USDT",
-                        "notional_usd": int(notional),
-                        "price": round(price, 6),
+                        "symbol": sym,
+                        "pair": f"{sym}USDT",
+                        "side": side,
+                        "usd": round(usd, 2),
                         "qty": round(qty, 6),
-                        "ts": ts,
+                        "price": round(price, 8),
+                        "time": dt.isoformat(timespec="seconds"),
                     })
-        except Exception:
-            continue
+        except Exception as e:
+            # swallow but keep note
+            alerts.append({
+                "symbol": sym,
+                "pair": f"{sym}USDT",
+                "error": repr(e)[:220],
+            })
+    # sort by usd desc if present
+    def usd_key(a):
+        return float(a.get("usd", 0.0))
+    alerts.sort(key=usd_key, reverse=True)
+    return alerts
 
-    alerts.sort(key=lambda a: (a.get("ts", 0), a.get("notional_usd", 0)), reverse=True)
-    alerts = alerts[:20]
+def get_state():
+    # cache
+    if _cache["data"] and (now_ts() - _cache["ts"] <= CACHE_TTL):
+        return _cache["data"]
 
-    payload = {"ts": now(), "whales": alerts, "threshold_usd": int(WHALE_NOTIONAL_USD)}
+    out = {
+        "ts": now_ts(),
+        "source": "binance",
+        "market_mode": "UNKNOWN",
+        "btc_24h": 0.0,
+        "eth_24h": 0.0,
+        "index": 0.0,
+        "filters": {
+            "vol_min_usd": VOL_MIN_USD,
+            "pct_min": PCT_MIN,
+            "pct_max": PCT_MAX,
+            "whale_threshold_usd": WHALE_THRESHOLD_USD,
+        },
+        "top_picks": [],
+        "whale_alerts": [],
+        "warnings": [],
+    }
 
-    _cache_whales["ts"] = now()
-    _cache_whales["data"] = payload
-    return payload
+    try:
+        tickers = fetch_binance_24h_all()
+    except Exception as e:
+        out["warnings"].append(f"Binance fetch failed: {repr(e)}")
+        _cache["ts"] = now_ts()
+        _cache["data"] = out
+        return out
 
-# ---------------------------
+    # BTC / ETH regime
+    btc = next((x for x in tickers if x.get("symbol") == "BTCUSDT"), None)
+    eth = next((x for x in tickers if x.get("symbol") == "ETHUSDT"), None)
+    btc_pct = safe_float(btc.get("priceChangePercent")) if btc else 0.0
+    eth_pct = safe_float(eth.get("priceChangePercent")) if eth else 0.0
+    mode, idx = compute_market_mode(btc_pct, eth_pct)
+
+    out["btc_24h"] = round(btc_pct, 2)
+    out["eth_24h"] = round(eth_pct, 2)
+    out["market_mode"] = mode
+    out["index"] = idx
+
+    # Picks
+    picks = build_top_picks_from_binance(tickers)
+    out["top_picks"] = picks
+
+    # Whale alerts
+    if picks:
+        out["whale_alerts"] = build_whale_alerts(picks, threshold_usd=WHALE_THRESHOLD_USD)
+
+    _cache["ts"] = now_ts()
+    _cache["data"] = out
+    return out
+
+
+# =========================
 # API
-# ---------------------------
+# =========================
 @app.get("/api/top", response_class=JSONResponse)
 def api_top():
-    return get_top_picks_cached()
+    return get_state()
 
-@app.get("/api/whales", response_class=JSONResponse)
-def api_whales():
-    return get_whales_cached()
-
-# ---------------------------
-# UI
-# ---------------------------
 @app.get("/", response_class=HTMLResponse)
 def home():
     return """
-    <html>
-      <head>
-        <meta name="viewport" content="width=device-width,initial-scale=1"/>
-        <style>
-          body{font-family:Arial;margin:18px;max-width:1050px}
-          .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-          .pill{border:1px solid #ddd;border-radius:999px;padding:8px 12px;display:inline-block}
-          .card{border:1px solid #ddd;border-radius:14px;padding:12px}
-          .muted{color:#666}
-          button{padding:8px 12px;border-radius:10px;border:1px solid #ccc;background:#fafafa}
-          .grid{display:grid;grid-template-columns:1fr;gap:10px}
-          @media(min-width:820px){.grid{grid-template-columns:1fr 1fr}}
-          .title{font-size:20px;font-weight:700;margin:0 0 6px}
-          .small{font-size:13px}
-          .score{font-weight:700}
-          .danger{color:#b00020}
-          .ok{color:#0b6}
-          .warn{color:#c90}
-          .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace}
-        </style>
-      </head>
-      <body>
-        <div class="title">Trade Radar (MVP+) — Yiğit Mode</div>
+<!doctype html>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width,initial-scale=1"/>
+    <title>Trade Radar (MVP+) — Yiğit Mode</title>
+    <style>
+      body{font-family:Arial;margin:18px;max-width:980px}
+      .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+      .pill{border:1px solid #ddd;border-radius:999px;padding:6px 10px;font-size:12px;background:#fafafa}
+      .card{border:1px solid #ddd;border-radius:12px;padding:12px;margin:10px 0}
+      .muted{color:#666}
+      button{padding:8px 12px;border-radius:10px;border:1px solid #ddd;background:#fff}
+      .warn{color:#b00020}
+      .good{color:#0a7}
+      .bad{color:#c00}
+      small{color:#666}
+      pre{white-space:pre-wrap}
+    </style>
+  </head>
+  <body>
+    <h2>Trade Radar (MVP+) — Yiğit Mode</h2>
 
-        <div class="row">
-          <div class="pill" id="mode">Market Mode: Loading...</div>
-          <div class="pill" id="btc">BTC 24h: ...</div>
-          <div class="pill" id="eth">ETH 24h: ...</div>
-          <div class="pill" id="idx">Index: ...</div>
-          <div class="pill muted small" id="cfg">Config: ...</div>
-          <div class="pill muted small" id="src">Source: ...</div>
-          <button onclick="reloadAll()">Yenile</button>
-        </div>
+    <div class="row" id="pills">
+      <span class="pill">Market Mode: <b id="mode">...</b></span>
+      <span class="pill">BTC 24h: <b id="btc">...</b></span>
+      <span class="pill">ETH 24h: <b id="eth">...</b></span>
+      <span class="pill">Index: <b id="idx">...</b></span>
+      <span class="pill" id="flt">...</span>
+      <button onclick="loadData()">Yenile</button>
+    </div>
 
-        <div id="err" class="danger" style="margin-top:10px"></div>
+    <div id="warn" class="warn"></div>
 
-        <h3 style="margin-top:18px">🔥 Top 10 “Tradeable” Picks</h3>
-        <div class="muted small">Not: Bu bir yatırım tavsiyesi değil. Sistem skor + risk şablonu üretir.</div>
-        <div id="picks" class="grid" style="margin-top:10px"></div>
+    <h3>🔥 Top 10 “Tradeable” Picks</h3>
+    <div class="muted">
+      Not: Bu bir yatırım tavsiyesi değil. Sistem skor + risk şablonu üretir.
+    </div>
+    <div id="list"></div>
 
-        <h3 style="margin-top:18px">🐋 Whale Alerts (Binance, threshold: <span class="mono" id="whaleTh"></span>)</h3>
-        <div id="whales" style="margin-top:10px"></div>
+    <h3>🐋 Whale Alerts (Binance, threshold: <span id="whaleTh">...</span>)</h3>
+    <div class="muted">Not: Whale = tek işlem değeri (yaklaşık) threshold üstü.</div>
+    <div id="whales"></div>
 
-        <script>
-          function pctClass(v){
-            if(v > 1) return "ok";
-            if(v < -1) return "danger";
-            return "warn";
-          }
+    <script>
+      function clsForMode(mode){
+        if(mode === "BULLISH") return "good";
+        if(mode === "BEARISH") return "bad";
+        return "";
+      }
 
-          async function reloadAll(){
-            document.getElementById('err').innerText = "";
-            document.getElementById('picks').innerHTML = "";
-            document.getElementById('whales').innerHTML = "";
-            document.getElementById('mode').innerText = "Market Mode: Loading...";
+      function fmtUSD(n){
+        const x = Number(n||0);
+        if(x>=1e9) return (x/1e9).toFixed(2)+"B";
+        if(x>=1e6) return (x/1e6).toFixed(2)+"M";
+        if(x>=1e3) return (x/1e3).toFixed(2)+"K";
+        return x.toFixed(0);
+      }
 
-            try{
-              const r = await fetch("/api/top");
-              const top = await r.json();
+      async function loadData(){
+        document.getElementById('warn').innerText = "";
+        document.getElementById('list').innerHTML = "";
+        document.getElementById('whales').innerHTML = "";
 
-              document.getElementById('mode').innerText = "Market Mode: " + (top.market_mode || "UNKNOWN");
-              document.getElementById('btc').innerHTML = `BTC 24h: <span class="${pctClass(top.btc_24h||0)}">${(top.btc_24h||0).toFixed(2)}%</span>`;
-              document.getElementById('eth').innerHTML = `ETH 24h: <span class="${pctClass(top.eth_24h||0)}">${(top.eth_24h||0).toFixed(2)}%</span>`;
-              document.getElementById('idx').innerHTML = `Index: <span class="${pctClass(top.market_index||0)}">${(top.market_index||0).toFixed(2)}</span>`;
-              document.getElementById('src').innerText = "Source: " + (top.source || "unknown");
+        let j;
+        try{
+          const r = await fetch("/api/top?ts=" + Date.now());
+          j = await r.json();
+        }catch(e){
+          document.getElementById('warn').innerText = "Fetch error: " + e.message;
+          return;
+        }
 
-              if(top.config){
-                document.getElementById('cfg').innerText =
-                  `VolMin=${(top.config.min_vol_usd||0).toLocaleString()} | 24h%=${top.config.min_abs_24h}-${top.config.max_abs_24h} | Whale=${(top.config.whale_threshold_usd||0).toLocaleString()}`;
-              }
+        const modeEl = document.getElementById('mode');
+        modeEl.innerText = j.market_mode || "UNKNOWN";
+        modeEl.className = clsForMode(j.market_mode || "UNKNOWN");
 
-              if(top.warning){
-                document.getElementById('err').innerText = "Warning: " + top.warning;
-              }
+        document.getElementById('btc').innerText = (j.btc_24h ?? 0).toFixed(2) + "%";
+        document.getElementById('eth').innerText = (j.eth_24h ?? 0).toFixed(2) + "%";
+        document.getElementById('idx').innerText = (j.index ?? 0).toFixed(2);
 
-              const picks = (top.top_picks || []);
-              const box = document.getElementById('picks');
+        const f = j.filters || {};
+        document.getElementById('flt').innerText =
+          `VolMin=${fmtUSD(f.vol_min_usd)} | 24h%=${f.pct_min}-${f.pct_max} | Whale=${fmtUSD(f.whale_threshold_usd)}`;
 
-              if(!picks.length){
-                const el = document.createElement('div');
-                el.className="card";
-                el.innerHTML = `<b>Top 10 boş geldi.</b><div class="muted small">Filtreler çok sıkı olabilir (VolMin / 24h%).</div>`;
-                box.appendChild(el);
-              }else{
-                picks.forEach(p=>{
-                  const el = document.createElement('div');
-                  el.className = "card";
-                  el.innerHTML = `
-                    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px">
-                      <div><b>${p.symbol}</b> <span class="muted small">(${p.why || ""})</span></div>
-                      <div class="score">Score: ${p.score}</div>
-                    </div>
-                    <div class="small" style="margin-top:6px">
-                      Price: <b>${p.price}</b> USD |
-                      24h: <span class="${pctClass(p.chg24_pct||0)}">${(p.chg24_pct||0).toFixed(2)}%</span> |
-                      Vol24: ${Number(p.vol24_usd||0).toLocaleString()} USD
-                    </div>
-                    <div class="small" style="margin-top:8px">
-                      Plan: Entry <b>${p.plan?.entry ?? "-"}</b>,
-                      SL <b>${p.plan?.stop ?? "-"}</b>,
-                      TP1 <b>${p.plan?.tp1 ?? "-"}</b>,
-                      TP2 <b>${p.plan?.tp2 ?? "-"}</b>
-                    </div>
-                  `;
-                  box.appendChild(el);
-                });
-              }
+        document.getElementById('whaleTh').innerText = "$" + fmtUSD(f.whale_threshold_usd);
 
-              const wr = await fetch("/api/whales");
-              const wj = await wr.json();
-              document.getElementById('whaleTh').innerText = "$" + (wj.threshold_usd||0).toLocaleString();
+        if(j.warnings && j.warnings.length){
+          document.getElementById('warn').innerText = "Warning: " + j.warnings.join(" | ");
+        }
 
-              if(wj && wj.whales && wj.whales.length){
-                const wbox = document.getElementById('whales');
-                wj.whales.forEach(w=>{
-                  const d = new Date((w.ts||0)*1000);
-                  const el = document.createElement('div');
-                  el.className = "card";
-                  el.innerHTML = `
-                    <b>${w.pair}</b> — <b>$${Number(w.notional_usd||0).toLocaleString()}</b>
-                    <div class="muted small">Price: ${w.price} | Qty: ${w.qty} | Time: ${d.toLocaleString()}</div>
-                  `;
-                  wbox.appendChild(el);
-                });
-              } else {
-                document.getElementById('whales').innerHTML =
-                  `<div class="muted small">Şu an threshold üstü whale işlemi yakalanmadı (veya Binance rate-limit).</div>`;
-              }
+        const list = document.getElementById('list');
+        if(!j.top_picks || j.top_picks.length === 0){
+          list.innerHTML = `<div class="muted">Top 10 boş geldi.<br>
+            Filtreler çok sıkı olabilir (VolMin / 24h%).</div>`;
+        }else{
+          j.top_picks.forEach(x=>{
+            const el = document.createElement('div'); el.className = "card";
+            const plan = x.plan || {};
+            el.innerHTML = `
+              <div class="row" style="justify-content:space-between">
+                <div>
+                  <b style="font-size:18px">${x.symbol}</b> <small>(${x.pair})</small>
+                </div>
+                <div class="pill">Score: <b>${x.score}</b></div>
+              </div>
+              <div class="muted">
+                Price: <b>${x.price}</b> USDT &nbsp;|&nbsp;
+                24h: <b>${(x.chg24_pct||0).toFixed(2)}%</b> &nbsp;|&nbsp;
+                Vol24: <b>${fmtUSD(x.vol24_usdt)}</b> USDT
+              </div>
+              <div style="margin-top:8px">
+                <div class="pill" style="display:inline-block;margin-right:6px">Entry: <b>${plan.entry}</b></div>
+                <div class="pill" style="display:inline-block;margin-right:6px">Stop: <b>${plan.stop}</b></div>
+                <div class="pill" style="display:inline-block;margin-right:6px">TP1: <b>${plan.tp1}</b></div>
+                <div class="pill" style="display:inline-block">TP2: <b>${plan.tp2}</b></div>
+              </div>
+            `;
+            list.appendChild(el);
+          });
+        }
 
-            }catch(e){
-              document.getElementById('err').innerText = "UI Error: " + e.message;
-              document.getElementById('mode').innerText = "Market Mode: UNKNOWN";
+        const whales = document.getElementById('whales');
+        if(!j.whale_alerts || j.whale_alerts.length === 0){
+          whales.innerHTML = `<div class="muted">Şu an threshold üstü whale işlemi yakalanmadı (veya endpoint limit/kısıt).</div>`;
+        }else{
+          j.whale_alerts.slice(0,12).forEach(w=>{
+            const el = document.createElement('div'); el.className="card";
+            if(w.error){
+              el.innerHTML = `<b>${w.symbol}</b> <small>(${w.pair})</small><br><span class="warn">${w.error}</span>`;
+            }else{
+              const sideCls = (w.side === "BUY") ? "good" : "bad";
+              el.innerHTML = `
+                <div class="row" style="justify-content:space-between">
+                  <div><b>${w.symbol}</b> <small>(${w.pair})</small></div>
+                  <div class="pill ${sideCls}"><b>${w.side}</b></div>
+                </div>
+                <div class="muted">
+                  Value: <b>$${fmtUSD(w.usd)}</b> | Qty: <b>${w.qty}</b> | Price: <b>${w.price}</b>
+                </div>
+                <div class="muted">Time: ${w.time}</div>
+              `;
             }
-          }
+            whales.appendChild(el);
+          });
+        }
+      }
 
-          reloadAll();
-          setInterval(reloadAll, 30000);
-        </script>
-      </body>
-    </html>
+      loadData();
+    </script>
+  </body>
+</html>
     """

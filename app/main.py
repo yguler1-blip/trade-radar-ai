@@ -104,28 +104,56 @@ def api_top():
     return get_top_picks()
 
 @app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse)
 def home():
     return """
     <html><head><meta name="viewport" content="width=device-width,initial-scale=1"/>
-    <style>body{font-family:Arial;margin:20px;max-width:900px}.card{border:1px solid #ddd;border-radius:12px;padding:12px;margin:10px 0}</style>
+    <style>
+      body{font-family:Arial;margin:20px;max-width:900px}
+      .card{border:1px solid #ddd;border-radius:12px;padding:12px;margin:10px 0}
+      .muted{color:#666}
+      button{padding:8px 12px}
+    </style>
     </head><body>
     <h2>Trade Radar (MVP)</h2>
-    <div id="mode">Loading...</div>
+    <div class="muted" id="mode">Loading...</div>
     <button onclick="loadData()">Yenile</button>
+    <div id="err" style="color:#b00020;margin-top:10px"></div>
     <div id="list"></div>
+
     <script>
       async function loadData(){
-        const r = await fetch('/api/top'); const d = await r.json();
-        document.getElementById('mode').innerText = "Market Mode: " + d.market_mode + " (ts=" + d.ts + ")";
-        const list = document.getElementById('list'); list.innerHTML = "";
-        d.top_picks.forEach(x=>{
-          const el = document.createElement('div'); el.className="card";
-          el.innerHTML = `<b>${x.symbol}</b> — Score: <b>${x.score}</b><br>
-          Fiyat: ${x.price} | 24h: ${x.chg24_pct}% | Spread: ${x.spread_pct}%<br>
-          Plan: Entry ${x.plan.entry} / Stop ${x.plan.stop} / TP1 ${x.plan.tp1} / TP2 ${x.plan.tp2}`;
-          list.appendChild(el);
-        })
+        document.getElementById('err').innerText = "";
+        document.getElementById('mode').innerText = "Loading...";
+        const list = document.getElementById('list');
+        list.innerHTML = "";
+
+        try{
+          // CoinGecko - browser’dan direkt
+          const url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=50&page=1&sparkline=false";
+          const r = await fetch(url, {headers: {"accept":"application/json"}});
+          if(!r.ok){
+            const t = await r.text();
+            throw new Error("CoinGecko HTTP " + r.status + " " + t.slice(0,120));
+          }
+          const data = await r.json();
+
+          document.getElementById('mode').innerText = "Market Mode: LIVE (browser fetch)";
+
+          data.slice(0,10).forEach(x=>{
+            const el = document.createElement('div'); el.className="card";
+            el.innerHTML = `<b>${(x.symbol||"").toUpperCase()}</b> (${x.name||""})<br>
+              Price: ${x.current_price} USD | 24h: ${(x.price_change_percentage_24h||0).toFixed(2)}%<br>
+              Vol24: ${Math.round(x.total_volume||0).toLocaleString()} USD`;
+            list.appendChild(el);
+          });
+
+        }catch(e){
+          document.getElementById('mode').innerText = "Market Mode: UNKNOWN";
+          document.getElementById('err').innerText = "Error: " + e.message;
+        }
       }
       loadData();
-    </script></body></html>
+    </script>
+    </body></html>
     """

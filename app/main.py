@@ -45,48 +45,44 @@ def build_trade_plan(last_price):
     return {"entry": round(entry, 8), "stop": round(stop, 8), "tp1": round(tp1, 8), "tp2": round(tp2, 8)}
 
 def get_top_picks():
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "order": "volume_desc",
-        "per_page": 100,
-        "page": 1,
-        "sparkline": "false"
-    }
+    url = "https://api.coincap.io/v2/assets?limit=200"
 
     try:
-        r = requests.get(url, params=params, timeout=25, headers={"User-Agent": "trade-radar-mvp"})
-        status = r.status_code
-        text_head = r.text[:200]  # ilk 200 karakter
+        r = requests.get(url, timeout=20)
         r.raise_for_status()
-        data = r.json()
+        data = r.json().get("data", [])
     except Exception as e:
-        msg = f"{repr(e)} | status={locals().get('status','?')} | body_head={locals().get('text_head','')}"
-        print("CoinGecko error:", msg)
-        return {"ts": int(time.time()), "market_mode": "UNKNOWN", "top_picks": [], "error": msg}
+        return {
+            "ts": int(time.time()),
+            "market_mode": "UNKNOWN",
+            "top_picks": [],
+            "error": repr(e)
+        }
 
     rows = []
     for coin in data:
-        vol = coin.get("total_volume") or 0
-        p24 = coin.get("price_change_percentage_24h") or 0
-        price = coin.get("current_price") or 0
+        try:
+            price = float(coin.get("priceUsd", 0))
+            p24 = float(coin.get("changePercent24Hr", 0))
+            vol = float(coin.get("volumeUsd24Hr", 0))
+        except:
+            continue
 
-        # eşik çok sıkı olmasın (boş kalmasın)
         if vol < 1_000_000:
             continue
         if price <= 0:
             continue
 
-        score = score_coin(p24=float(p24), vol24_usdt=float(vol), spread=0.002)
+        score = score_coin(p24=p24, vol24_usdt=vol, spread=0.002)
 
         rows.append({
-            "symbol": (coin.get("symbol") or "").upper(),
-            "price": price,
-            "chg24_pct": round(float(p24), 2),
+            "symbol": coin.get("symbol", ""),
+            "price": round(price, 6),
+            "chg24_pct": round(p24, 2),
             "vol24_usdt": int(vol),
             "spread_pct": 0.2,
             "score": score,
-            "plan": build_trade_plan(float(price))
+            "plan": build_trade_plan(price)
         })
 
     rows.sort(key=lambda r: r["score"], reverse=True)

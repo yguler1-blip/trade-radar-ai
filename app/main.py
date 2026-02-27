@@ -45,6 +45,25 @@ def build_trade_plan(last_price):
     return {"entry": round(entry, 8), "stop": round(stop, 8), "tp1": round(tp1, 8), "tp2": round(tp2, 8)}
 
 def get_top_picks():
+    def get_market_mode_from_btc(assets):
+    btc = next((c for c in assets if c.get("symbol") == "BTC"), None)
+    if not btc:
+        return "NEUTRAL"
+
+    try:
+        btc_p24 = float(btc.get("changePercent24Hr", 0))
+    except:
+        btc_p24 = 0.0
+
+    if btc_p24 > 1.0:
+        return "BULLISH"
+    elif btc_p24 < -1.0:
+        return "BEARISH"
+    else:
+        return "NEUTRAL"
+
+
+def get_top_picks():
     # CryptoCompare top by volume (USD)
     url = "https://min-api.cryptocompare.com/data/top/totalvolfull"
     params = {"limit": 50, "tsym": "USD"}

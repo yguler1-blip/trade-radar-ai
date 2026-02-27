@@ -136,7 +136,8 @@ def home():
             const t = await r.text();
             throw new Error("CoinGecko HTTP " + r.status + " " + t.slice(0,120));
           }
-          const data = await r.json(); // BTC market trend hesaplama
+          const data = await r.json();
+          // BTC market trend hesaplama
 const btc = data.find(x => (x.symbol || "").toLowerCase() === "btc");
 let mode = "NEUTRAL";
 let btcChg = 0;
@@ -147,6 +148,8 @@ if (btc) {
   else if (btcChg < -1) mode = "BEARISH";
 }
 
+document.getElementById('mode').innerText =
+  `Market Mode: ${mode} | BTC 24h: ${btcChg.toFixed(2)}%`;
 document.getElementById('mode').innerText =
   `Market Mode: ${mode} | BTC 24h: ${btcChg.toFixed(2)}%`;
           document.getElementById('mode').innerText = "Market Mode: LIVE (browser fetch)";

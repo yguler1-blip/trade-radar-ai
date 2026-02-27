@@ -4,7 +4,7 @@ import time, math, requests
 
 app = FastAPI(title="Trade Radar (MVP)")
 
-BINANCE = "https://api.binance.com"
+
 CACHE_TTL = 60
 _cache = {"ts": 0, "data": None}
 
@@ -45,76 +45,51 @@ def build_trade_plan(last_price):
     return {"entry": round(entry, 8), "stop": round(stop, 8), "tp1": round(tp1, 8), "tp2": round(tp2, 8)}
 
 def get_top_picks():
-    now = time.time()
-    if _cache["data"] is not None and (now - _cache["ts"]) < CACHE_TTL:
-        return _cache["data"]
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": "usd",
+        "order": "volume_desc",
+        "per_page": 100,
+        "page": 1,
+        "sparkline": "false"
+    }
 
-    tickers = get_json(f"{BINANCE}/api/v3/ticker/24hr")
-    usdt = []
-    for t in tickers:
-        sym = t.get("symbol", "")
-        if not sym.endswith("USDT"):
-            continue
-        if any(x in sym for x in ["UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT"]):
-            continue
-        last_price = safe_float(t.get("lastPrice"))
-        if last_price <= 0:
-            continue
-        quote_vol = safe_float(t.get("quoteVolume"))
-        p24 = safe_float(t.get("priceChangePercent"))
-        usdt.append((sym, last_price, quote_vol, p24))
-
-    usdt.sort(key=lambda x: x[2], reverse=True)
-    candidates = usdt[:120]
-
-    books = get_json(f"{BINANCE}/api/v3/ticker/bookTicker")
-    book_map = {b["symbol"]: b for b in books}
+    try:
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print("CoinGecko error:", e)
+        return {"ts": int(time.time()), "market_mode": "UNKNOWN", "top_picks": []}
 
     rows = []
-    for sym, last_price, vol24, p24 in candidates:
-        b = book_map.get(sym)
-        if not b:
-            continue
-        bid = safe_float(b.get("bidPrice"))
-        ask = safe_float(b.get("askPrice"))
-        if bid <= 0 or ask <= 0 or ask <= bid:
-            continue
-        mid = (bid + ask) / 2
-        spread = (ask - bid) / mid
+    for coin in data:
+        vol = coin.get("total_volume", 0)
+        p24 = coin.get("price_change_percentage_24h", 0)
+        price = coin.get("current_price", 0)
 
-        if vol24 < 10_000_000:
-            continue
-        if spread > 0.008:
+        if vol < 10_000_000:
             continue
 
-        sc = score_coin(p24=p24, vol24_usdt=vol24, spread=spread)
+        score = score_coin(p24=p24 or 0, vol24_usdt=vol, spread=0.002)
+
         rows.append({
-            "symbol": sym,
-            "price": round(last_price, 8),
-            "chg24_pct": round(p24, 2),
-            "vol24_usdt": int(vol24),
-            "spread_pct": round(spread * 100, 3),
-            "score": sc,
-            "plan": build_trade_plan(last_price),
+            "symbol": coin["symbol"].upper(),
+            "price": price,
+            "chg24_pct": round(p24 or 0, 2),
+            "vol24_usdt": int(vol),
+            "spread_pct": 0.2,
+            "score": score,
+            "plan": build_trade_plan(price)
         })
 
     rows.sort(key=lambda r: r["score"], reverse=True)
-    top = rows[:10]
 
-    btc = next((x for x in usdt if x[0] == "BTCUSDT"), None)
-    mode = "NEUTRAL"
-    if btc:
-        btc_p24 = btc[3]
-        if btc_p24 > 1.0:
-            mode = "RISK-ON"
-        elif btc_p24 < -1.0:
-            mode = "RISK-OFF"
-
-    data = {"ts": int(now), "market_mode": mode, "top_picks": top}
-    _cache["ts"] = now
-    _cache["data"] = data
-    return data
-
+    return {
+        "ts": int(time.time()),
+        "market_mode": "RISK-ON",
+        "top_picks": rows[:10]
+    }
 @app.get("/api/top", response_class=JSONResponse)
 def api_top():
     return get_top_picks()

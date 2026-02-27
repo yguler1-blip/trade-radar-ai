@@ -55,32 +55,38 @@ def get_top_picks():
     }
 
     try:
-        r = requests.get(url, params=params, timeout=20)
+        r = requests.get(url, params=params, timeout=25, headers={"User-Agent": "trade-radar-mvp"})
+        status = r.status_code
+        text_head = r.text[:200]  # ilk 200 karakter
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        print("CoinGecko error:", e)
-        return {"ts": int(time.time()), "market_mode": "UNKNOWN", "top_picks": []}
+        msg = f"{repr(e)} | status={locals().get('status','?')} | body_head={locals().get('text_head','')}"
+        print("CoinGecko error:", msg)
+        return {"ts": int(time.time()), "market_mode": "UNKNOWN", "top_picks": [], "error": msg}
 
     rows = []
     for coin in data:
-        vol = coin.get("total_volume", 0)
-        p24 = coin.get("price_change_percentage_24h", 0)
-        price = coin.get("current_price", 0)
+        vol = coin.get("total_volume") or 0
+        p24 = coin.get("price_change_percentage_24h") or 0
+        price = coin.get("current_price") or 0
 
-        if vol < 10_000_000:
+        # eşik çok sıkı olmasın (boş kalmasın)
+        if vol < 1_000_000:
+            continue
+        if price <= 0:
             continue
 
-        score = score_coin(p24=p24 or 0, vol24_usdt=vol, spread=0.002)
+        score = score_coin(p24=float(p24), vol24_usdt=float(vol), spread=0.002)
 
         rows.append({
-            "symbol": coin["symbol"].upper(),
+            "symbol": (coin.get("symbol") or "").upper(),
             "price": price,
-            "chg24_pct": round(p24 or 0, 2),
+            "chg24_pct": round(float(p24), 2),
             "vol24_usdt": int(vol),
             "spread_pct": 0.2,
             "score": score,
-            "plan": build_trade_plan(price)
+            "plan": build_trade_plan(float(price))
         })
 
     rows.sort(key=lambda r: r["score"], reverse=True)

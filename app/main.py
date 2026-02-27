@@ -8,25 +8,18 @@ app = FastAPI(title="Trade Radar (MVP+)")
 # ---------------------------
 # CONFIG
 # ---------------------------
-CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "75"))
-UNIVERSE_LIMIT = int(os.getenv("UNIVERSE_LIMIT", "70"))
+CACHE_TTL_SEC = int(os.getenv("CACHE_TTL_SEC", "60"))
 TOP_PICKS = int(os.getenv("TOP_PICKS", "10"))
 
-MIN_VOL_USD = float(os.getenv("MIN_VOL_USD", "60000000"))      # 60M/day
+MIN_VOL_USD = float(os.getenv("MIN_VOL_USD", "60000000"))   # 60M/day
 MIN_PRICE_USD = float(os.getenv("MIN_PRICE_USD", "0.00001"))
-MAX_ABS_24H = float(os.getenv("MAX_ABS_24H", "25"))            # pump killer
+
+MAX_ABS_24H = float(os.getenv("MAX_ABS_24H", "25"))         # pump killer
 MIN_ABS_24H = float(os.getenv("MIN_ABS_24H", "2.0"))
 
-RSI_OVERSOLD = float(os.getenv("RSI_OVERSOLD", "35"))
-RSI_OVERBOUGHT = float(os.getenv("RSI_OVERBOUGHT", "72"))
-
 WHALE_TTL_SEC = int(os.getenv("WHALE_TTL_SEC", "30"))
-WHALE_LOOKBACK_TRADES = int(os.getenv("WHALE_LOOKBACK_TRADES", "70"))
+WHALE_LOOKBACK_TRADES = int(os.getenv("WHALE_LOOKBACK_TRADES", "80"))
 WHALE_NOTIONAL_USD = float(os.getenv("WHALE_NOTIONAL_USD", "750000"))
-
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TG_ENABLED = bool(TG_TOKEN and TG_CHAT_ID and os.getenv("TELEGRAM_ENABLED", "0") == "1")
 
 USER_AGENT = {"User-Agent": "trade-radar-mvp-plus"}
 
@@ -36,7 +29,6 @@ STABLE_SKIP = {
 
 _cache_top = {"ts": 0, "data": None}
 _cache_whales = {"ts": 0, "data": None}
-_cache_binance_symbols = {"ts": 0, "set": set()}
 
 # ---------------------------
 # HELPERS
@@ -61,68 +53,7 @@ def http_get_json(url, params=None, timeout=20, headers=None):
     r.raise_for_status()
     return r.json()
 
-def ema(values, period):
-    if not values or period <= 0:
-        return None
-    k = 2 / (period + 1)
-    e = values[0]
-    for v in values[1:]:
-        e = v * k + e * (1 - k)
-    return e
-
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return None
-    gains, losses = [], []
-    for i in range(1, period + 1):
-        d = values[i] - values[i - 1]
-        gains.append(max(d, 0.0))
-        losses.append(max(-d, 0.0))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    for i in range(period + 1, len(values)):
-        d = values[i] - values[i - 1]
-        g = max(d, 0.0)
-        l = max(-d, 0.0)
-        avg_gain = (avg_gain * (period - 1) + g) / period
-        avg_loss = (avg_loss * (period - 1) + l) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
-
-def atr(highs, lows, closes, period=14):
-    if len(closes) < period + 1:
-        return None
-    trs = []
-    for i in range(1, len(closes)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1]),
-        )
-        trs.append(tr)
-    if len(trs) < period:
-        return None
-    a = sum(trs[:period]) / period
-    for tr in trs[period:]:
-        a = (a * (period - 1) + tr) / period
-    return a
-
-def build_trade_plan(price, atr_val=None):
-    if not price or price <= 0:
-        return {"entry": None, "stop": None, "tp1": None, "tp2": None}
-    if atr_val and atr_val > 0:
-        stop = price - 1.15 * atr_val
-        tp1 = price + 0.95 * atr_val
-        tp2 = price + 1.65 * atr_val
-    else:
-        stop = price * 0.975
-        tp1 = price * 1.03
-        tp2 = price * 1.055
-    return {"entry": round(price, 8), "stop": round(max(stop, 0), 8), "tp1": round(tp1, 8), "tp2": round(tp2, 8)}
-
-def score_coin(p24, vol24_usd, spread_pct, rsi14=None, ema20v=None, ema50v=None, atrv=None, price=None, market_gate="NEUTRAL"):
+def score_coin(p24, vol24_usd, spread_pct=0.002, market_gate="NEUTRAL"):
     # momentum
     p24c = clamp(p24, -18.0, 22.0)
     momentum = clamp((p24c + 18.0) / 40.0 * 100.0, 0, 100)
@@ -131,58 +62,29 @@ def score_coin(p24, vol24_usd, spread_pct, rsi14=None, ema20v=None, ema50v=None,
     vol = max(vol24_usd, 1.0)
     liq = clamp((math.log10(vol) - 7.5) / (10.0 - 7.5) * 100.0, 0, 100)
 
-    # spread score
+    # spread score (rough)
     spread = clamp((0.010 - spread_pct) / (0.010 - 0.001) * 100.0, 0, 100)
 
-    # trend
-    trend = 45.0
-    if ema20v is not None and ema50v is not None:
-        trend = 85.0 if ema20v > ema50v else 25.0
-
-    # RSI
-    rsi_score = 55.0
-    if rsi14 is not None:
-        if rsi14 < RSI_OVERSOLD:
-            rsi_score = 70.0
-        elif rsi14 > RSI_OVERBOUGHT:
-            rsi_score = 15.0
-        else:
-            rsi_score = clamp(70.0 - (rsi14 - RSI_OVERSOLD) * (35.0 / (RSI_OVERBOUGHT - RSI_OVERSOLD)), 35.0, 70.0)
-
-    # risk from ATR%
-    risk = 55.0
-    if atrv is not None and price and price > 0:
-        atr_pct = (atrv / price) * 100.0
-        if atr_pct > 6:
-            risk = 15.0
-        elif atr_pct > 4.2:
-            risk = 30.0
-        else:
-            risk = 70.0
-
-    base = (
-        0.22 * momentum +
-        0.30 * liq +
-        0.10 * spread +
-        0.22 * trend +
-        0.11 * rsi_score +
-        0.05 * risk
-    )
+    base = 0.35 * momentum + 0.50 * liq + 0.15 * spread
 
     if market_gate in ("BEARISH", "PANIC"):
         base -= 6.0
-        if ema20v is not None and ema50v is not None and ema20v < ema50v:
-            base -= 6.0
-        if rsi14 is not None and rsi14 > 65:
+        if p24 > 8:
             base -= 4.0
 
     return round(clamp(base, 0, 100), 1)
+
+def build_trade_plan(price):
+    # very simple plan; later ATR ekleriz
+    stop = price * 0.975
+    tp1 = price * 1.03
+    tp2 = price * 1.055
+    return {"entry": round(price, 8), "stop": round(stop, 8), "tp1": round(tp1, 8), "tp2": round(tp2, 8)}
 
 def compute_market_mode(rows_sorted_by_vol):
     by_sym = {r["symbol"]: r for r in rows_sorted_by_vol}
     btc = by_sym.get("BTC")
     eth = by_sym.get("ETH")
-
     btc_chg = safe_float(btc["chg24_pct"]) if btc else 0.0
     eth_chg = safe_float(eth["chg24_pct"]) if eth else 0.0
 
@@ -193,24 +95,23 @@ def compute_market_mode(rows_sorted_by_vol):
 
     if idx > 1.2:
         mode = "STRONG BULLISH"
+        gate = "BULLISH"
     elif idx > 0.4:
         mode = "BULLISH"
+        gate = "BULLISH"
     elif idx < -1.2:
         mode = "PANIC"
+        gate = "PANIC"
     elif idx < -0.4:
         mode = "BEARISH"
+        gate = "BEARISH"
     else:
         mode = "NEUTRAL"
-
-    gate = "NEUTRAL"
-    if mode == "BEARISH":
-        gate = "BEARISH"
-    if mode == "PANIC":
-        gate = "PANIC"
+        gate = "NEUTRAL"
 
     return mode, gate, round(idx, 2), round(btc_chg, 2), round(eth_chg, 2), round(median20, 2)
 
-def explain_pick(p24, vol24, rsi14, ema20v, ema50v, gate):
+def explain_pick(p24, vol24):
     reasons = []
     if vol24 >= 300_000_000:
         reasons.append("çok yüksek likidite")
@@ -221,126 +122,99 @@ def explain_pick(p24, vol24, rsi14, ema20v, ema50v, gate):
         reasons.append("güçlü momentum")
     elif p24 >= 3:
         reasons.append("pozitif momentum")
+    else:
+        reasons.append("ılımlı hareket")
 
-    if rsi14 is not None:
-        if rsi14 < RSI_OVERSOLD:
-            reasons.append("RSI düşük (bounce)")
-        elif rsi14 > RSI_OVERBOUGHT:
-            reasons.append("RSI yüksek (ısınmış)")
-        else:
-            reasons.append("RSI dengeli")
-
-    if ema20v is not None and ema50v is not None:
-        if ema20v > ema50v:
-            reasons.append("trend yukarı (EMA20>EMA50)")
-        else:
-            reasons.append("trend zayıf (EMA20<EMA50)")
-
-    if gate in ("BEARISH", "PANIC"):
-        reasons.append(f"market gate: {gate}")
-
-    return ", ".join(reasons) if reasons else "likidite + trend + RSI filtresi"
-
-def send_telegram(text: str):
-    if not TG_ENABLED:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        payload = {"chat_id": TG_CHAT_ID, "text": text}
-        requests.post(url, json=payload, timeout=10)
-    except Exception:
-        pass
-
+    return ", ".join(reasons)
 
 # ---------------------------
-# DATA SOURCES
+# BINANCE DATA
 # ---------------------------
-def fetch_universe_cryptocompare(limit=UNIVERSE_LIMIT):
-    url = "https://min-api.cryptocompare.com/data/top/totalvolfull"
-    params = {"limit": limit, "tsym": "USD"}
-    payload = http_get_json(url, params=params, timeout=25)
-    return payload.get("Data", []) or []
-
-def fetch_histohour_cryptocompare(symbol, hours=240):
-    url = "https://min-api.cryptocompare.com/data/v2/histohour"
-    params = {"fsym": symbol, "tsym": "USD", "limit": hours}
-    payload = http_get_json(url, params=params, timeout=25)
-    data = ((payload.get("Data") or {}).get("Data")) or []
-    return data
-
-def fetch_universe_coingecko(limit=UNIVERSE_LIMIT):
-    # server-side fallback; sometimes rate-limited, but better than empty
-    url = "https://api.coingecko.com/api/v3/coins/markets"
-    params = {
-        "vs_currency": "usd",
-        "order": "volume_desc",
-        "per_page": limit,
-        "page": 1,
-        "sparkline": "false",
-        "price_change_percentage": "24h"
-    }
-    data = http_get_json(url, params=params, timeout=25, headers={"accept": "application/json"})
+def fetch_binance_24h_all():
+    # NOTE: This is the workhorse. With caching we avoid 429.
+    url = "https://api.binance.com/api/v3/ticker/24hr"
+    data = http_get_json(url, timeout=25)
     return data if isinstance(data, list) else []
 
-def refresh_binance_symbol_set(force=False):
-    if not force and _cache_binance_symbols["ts"] and now() - _cache_binance_symbols["ts"] < 6 * 3600:
-        return _cache_binance_symbols["set"]
-    try:
-        url = "https://api.binance.com/api/v3/exchangeInfo"
-        js = http_get_json(url, timeout=25)
-        syms = set()
-        for s in js.get("symbols", []):
-            if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT":
-                syms.add(s.get("baseAsset"))
-        _cache_binance_symbols["ts"] = now()
-        _cache_binance_symbols["set"] = syms
-        return syms
-    except Exception:
-        return _cache_binance_symbols["set"]
-
-def fetch_binance_recent_trades_usdt(symbol, limit=WHALE_LOOKBACK_TRADES):
+def fetch_binance_agg_trades(symbol, limit=WHALE_LOOKBACK_TRADES):
     pair = f"{symbol}USDT"
     url = "https://api.binance.com/api/v3/aggTrades"
     params = {"symbol": pair, "limit": limit}
     return http_get_json(url, params=params, timeout=20)
 
-
 # ---------------------------
-# TOP PICKS (with fallback)
+# TOP PICKS (BINANCE ONLY)
 # ---------------------------
 def get_top_picks_cached():
     if _cache_top["data"] and (now() - _cache_top["ts"] < CACHE_TTL_SEC):
         return _cache_top["data"]
 
-    source = "cryptocompare"
-    error = None
+    source = "binance"
+    warning = None
 
-    # 1) Try CryptoCompare first
-    universe = []
+    rows_all = []
     try:
-        universe = fetch_universe_cryptocompare(UNIVERSE_LIMIT)
+        data = fetch_binance_24h_all()
     except Exception as e:
-        error = f"CryptoCompare fetch failed: {repr(e)}"
+        payload = {
+            "ts": now(),
+            "source": source,
+            "market_mode": "UNKNOWN",
+            "market_gate": "UNKNOWN",
+            "market_index": 0,
+            "btc_24h": 0,
+            "eth_24h": 0,
+            "median20_24h": 0,
+            "top_picks": [],
+            "config": {
+                "whale_threshold_usd": int(WHALE_NOTIONAL_USD),
+                "min_vol_usd": int(MIN_VOL_USD),
+                "min_abs_24h": MIN_ABS_24H,
+                "max_abs_24h": MAX_ABS_24H,
+            },
+            "warning": f"Binance fetch failed: {repr(e)}"
+        }
+        _cache_top["ts"] = now()
+        _cache_top["data"] = payload
+        return payload
 
-    mode_rows = []
-    base_rows = []
+    # filter USDT pairs only, ignore leveraged tokens, ignore stables
+    for x in data:
+        sym_pair = (x.get("symbol") or "")
+        if not sym_pair.endswith("USDT"):
+            continue
+        base = sym_pair[:-4]  # remove USDT
 
-    # parse CC (RAW sometimes missing -> empty result)
-    for item in universe:
-        coin_info = item.get("CoinInfo", {}) or {}
-        raw = (item.get("RAW", {}) or {}).get("USD", {}) or {}
-        sym = coin_info.get("Name", "") or ""
-        if not sym or sym in STABLE_SKIP:
+        if not base or base in STABLE_SKIP:
+            continue
+        if "UP" in base or "DOWN" in base or base.endswith("BULL") or base.endswith("BEAR"):
             continue
 
-        price = safe_float(raw.get("PRICE"))
-        p24 = safe_float(raw.get("CHANGEPCT24HOUR"))
-        vol24 = safe_float(raw.get("TOTALVOLUME24H"), 0.0) * price
+        last_price = safe_float(x.get("lastPrice"))
+        quote_vol = safe_float(x.get("quoteVolume"))  # already in quote (USDT) -> USD-ish
+        p24 = safe_float(x.get("priceChangePercent"))
 
-        if price <= 0 or vol24 <= 0:
+        if last_price <= 0 or quote_vol <= 0:
             continue
 
-        mode_rows.append({"symbol": sym, "chg24_pct": round(p24, 2), "vol24_usd": int(vol24)})
+        rows_all.append({
+            "symbol": base,
+            "pair": sym_pair,
+            "price": last_price,
+            "chg24_pct": p24,
+            "vol24_usd": quote_vol
+        })
+
+    # market mode calc from top volume
+    rows_by_vol = sorted(rows_all, key=lambda r: r["vol24_usd"], reverse=True)
+    market_mode, gate, market_index, btc24, eth24, median20 = compute_market_mode(rows_by_vol)
+
+    # tradeable filter + score
+    tradeable = []
+    for r in rows_all:
+        price = r["price"]
+        vol24 = r["vol24_usd"]
+        p24 = r["chg24_pct"]
 
         if price < MIN_PRICE_USD:
             continue
@@ -351,116 +225,18 @@ def get_top_picks_cached():
         if abs(p24) < MIN_ABS_24H:
             continue
 
-        base_rows.append({"symbol": sym, "price": price, "chg24_pct": p24, "vol24_usd": vol24})
-
-    # 2) If CC produced nothing, fallback to CoinGecko
-    if not mode_rows or not base_rows:
-        source = "coingecko_fallback"
-        cg_err = None
-        cg = []
-        try:
-            cg = fetch_universe_coingecko(UNIVERSE_LIMIT)
-        except Exception as e:
-            cg_err = f"CoinGecko fetch failed: {repr(e)}"
-
-        mode_rows = []
-        base_rows = []
-
-        for x in cg:
-            sym = (x.get("symbol") or "").upper()
-            if not sym or sym in STABLE_SKIP:
-                continue
-            price = safe_float(x.get("current_price"))
-            p24 = safe_float(x.get("price_change_percentage_24h"))
-            vol24 = safe_float(x.get("total_volume"))
-
-            if price <= 0 or vol24 <= 0:
-                continue
-
-            mode_rows.append({"symbol": sym, "chg24_pct": round(p24, 2), "vol24_usd": int(vol24)})
-
-            if price < MIN_PRICE_USD:
-                continue
-            if vol24 < MIN_VOL_USD:
-                continue
-            if abs(p24) > MAX_ABS_24H:
-                continue
-            if abs(p24) < MIN_ABS_24H:
-                continue
-
-            base_rows.append({"symbol": sym, "price": price, "chg24_pct": p24, "vol24_usd": vol24})
-
-        if not mode_rows:
-            error = (error or "") + (" | " if error else "") + (cg_err or "No CoinGecko data")
-        else:
-            # keep earlier error info for transparency
-            if error:
-                error = error + " | Using CoinGecko fallback"
-            elif cg_err:
-                error = cg_err
-
-    # compute market mode
-    mode_rows.sort(key=lambda x: x["vol24_usd"], reverse=True)
-    market_mode, gate, market_index, btc24, eth24, median20 = compute_market_mode(mode_rows)
-
-    # enrich subset (CryptoCompare candles if possible; else leave indicators None)
-    base_rows.sort(key=lambda x: x["vol24_usd"], reverse=True)
-    base_rows = base_rows[:min(35, len(base_rows))]
-
-    enriched = []
-    for r in base_rows:
-        sym = r["symbol"]
-        price = r["price"]
-
-        rsi14 = None
-        ema20v = None
-        ema50v = None
-        atrv = None
-
-        # indicators only if CryptoCompare histo works (it usually does)
-        try:
-            candles = fetch_histohour_cryptocompare(sym, hours=240)
-            closes = [safe_float(c.get("close")) for c in candles if safe_float(c.get("close")) > 0]
-            highs = [safe_float(c.get("high")) for c in candles if safe_float(c.get("high")) > 0]
-            lows = [safe_float(c.get("low")) for c in candles if safe_float(c.get("low")) > 0]
-
-            if len(closes) >= 80:
-                rsi14 = rsi(closes, 14)
-                ema20v = ema(closes[-100:], 20)
-                ema50v = ema(closes[-150:], 50)
-                if len(highs) == len(lows) == len(closes):
-                    atrv = atr(highs, lows, closes, 14)
-        except Exception:
-            pass
-
-        spread_pct = 0.002
-        score = score_coin(
-            p24=r["chg24_pct"],
-            vol24_usd=r["vol24_usd"],
-            spread_pct=spread_pct,
-            rsi14=rsi14,
-            ema20v=ema20v,
-            ema50v=ema50v,
-            atrv=atrv,
-            price=price,
-            market_gate=gate,
-        )
-
-        enriched.append({
-            "symbol": sym,
+        score = score_coin(p24=p24, vol24_usd=vol24, market_gate=gate)
+        tradeable.append({
+            "symbol": r["symbol"],
             "price": round(price, 6),
-            "chg24_pct": round(r["chg24_pct"], 2),
-            "vol24_usd": int(r["vol24_usd"]),
+            "chg24_pct": round(p24, 2),
+            "vol24_usd": int(vol24),
             "score": score,
-            "rsi14": round(rsi14, 2) if rsi14 is not None else None,
-            "ema20": round(ema20v, 6) if ema20v is not None else None,
-            "ema50": round(ema50v, 6) if ema50v is not None else None,
-            "atr": round(atrv, 6) if atrv is not None else None,
-            "plan": build_trade_plan(price, atrv),
-            "why": explain_pick(r["chg24_pct"], r["vol24_usd"], rsi14, ema20v, ema50v, gate),
+            "plan": build_trade_plan(price),
+            "why": explain_pick(p24, vol24)
         })
 
-    enriched.sort(key=lambda x: x["score"], reverse=True)
+    tradeable.sort(key=lambda r: r["score"], reverse=True)
 
     payload = {
         "ts": now(),
@@ -471,7 +247,7 @@ def get_top_picks_cached():
         "btc_24h": btc24,
         "eth_24h": eth24,
         "median20_24h": median20,
-        "top_picks": enriched[:TOP_PICKS],
+        "top_picks": tradeable[:TOP_PICKS],
         "config": {
             "whale_threshold_usd": int(WHALE_NOTIONAL_USD),
             "min_vol_usd": int(MIN_VOL_USD),
@@ -479,13 +255,12 @@ def get_top_picks_cached():
             "max_abs_24h": MAX_ABS_24H,
         }
     }
-    if error:
-        payload["warning"] = error
+    if warning:
+        payload["warning"] = warning
 
     _cache_top["ts"] = now()
     _cache_top["data"] = payload
     return payload
-
 
 # ---------------------------
 # WHALES
@@ -496,15 +271,12 @@ def get_whales_cached():
 
     top = get_top_picks_cached()
     picks = (top.get("top_picks") or [])
-    symbols = [x["symbol"] for x in picks]
-
-    binance_set = refresh_binance_symbol_set()
-    watch = [s for s in symbols if s in binance_set]
+    symbols = [x["symbol"] for x in picks][:7]
 
     alerts = []
-    for s in watch[:7]:
+    for s in symbols:
         try:
-            trades = fetch_binance_recent_trades_usdt(s, limit=WHALE_LOOKBACK_TRADES)
+            trades = fetch_binance_agg_trades(s, limit=WHALE_LOOKBACK_TRADES)
             for t in trades:
                 price = safe_float(t.get("p"))
                 qty = safe_float(t.get("q"))
@@ -527,16 +299,9 @@ def get_whales_cached():
 
     payload = {"ts": now(), "whales": alerts, "threshold_usd": int(WHALE_NOTIONAL_USD)}
 
-    if TG_ENABLED and alerts:
-        newest = alerts[0]
-        if newest.get("ts", 0) and now() - newest["ts"] < 60:
-            msg = f"🐋 Whale Alert: {newest['pair']} ~${newest['notional_usd']:,} @ {newest['price']}"
-            send_telegram(msg)
-
     _cache_whales["ts"] = now()
     _cache_whales["data"] = payload
     return payload
-
 
 # ---------------------------
 # API
@@ -548,7 +313,6 @@ def api_top():
 @app.get("/api/whales", response_class=JSONResponse)
 def api_whales():
     return get_whales_cached()
-
 
 # ---------------------------
 # UI
@@ -637,7 +401,7 @@ def home():
               if(!picks.length){
                 const el = document.createElement('div');
                 el.className="card";
-                el.innerHTML = `<b>Top 10 boş geldi.</b><div class="muted small">Genelde API data vermiyor / rate-limit. Warning satırına bak.</div>`;
+                el.innerHTML = `<b>Top 10 boş geldi.</b><div class="muted small">Filtreler çok sıkı olabilir (VolMin / 24h%).</div>`;
                 box.appendChild(el);
               }else{
                 picks.forEach(p=>{
@@ -653,9 +417,6 @@ def home():
                       24h: <span class="${pctClass(p.chg24_pct||0)}">${(p.chg24_pct||0).toFixed(2)}%</span> |
                       Vol24: ${Number(p.vol24_usd||0).toLocaleString()} USD
                     </div>
-                    <div class="small muted" style="margin-top:6px">
-                      RSI14: ${p.rsi14 ?? "-"} | EMA20: ${p.ema20 ?? "-"} | EMA50: ${p.ema50 ?? "-"} | ATR: ${p.atr ?? "-"}
-                    </div>
                     <div class="small" style="margin-top:8px">
                       Plan: Entry <b>${p.plan?.entry ?? "-"}</b>,
                       SL <b>${p.plan?.stop ?? "-"}</b>,
@@ -667,7 +428,6 @@ def home():
                 });
               }
 
-              // whales
               const wr = await fetch("/api/whales");
               const wj = await wr.json();
               document.getElementById('whaleTh').innerText = "$" + (wj.threshold_usd||0).toLocaleString();

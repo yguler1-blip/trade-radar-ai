@@ -45,41 +45,43 @@ def build_trade_plan(last_price):
     return {"entry": round(entry, 8), "stop": round(stop, 8), "tp1": round(tp1, 8), "tp2": round(tp2, 8)}
 
 def get_top_picks():
-    url = "https://api.coincap.io/v2/assets?limit=200"
+    # CryptoCompare top by volume (USD)
+    url = "https://min-api.cryptocompare.com/data/top/totalvolfull"
+    params = {"limit": 50, "tsym": "USD"}
+    headers = {"User-Agent": "trade-radar-mvp"}
 
     try:
-        r = requests.get(url, timeout=20)
+        r = requests.get(url, params=params, timeout=25, headers=headers)
         r.raise_for_status()
-        data = r.json().get("data", [])
+        payload = r.json()
+        data = payload.get("Data", [])
+        if not data:
+            return {"ts": int(time.time()), "market_mode": "UNKNOWN", "top_picks": [], "error": "No data from CryptoCompare"}
     except Exception as e:
-        return {
-            "ts": int(time.time()),
-            "market_mode": "UNKNOWN",
-            "top_picks": [],
-            "error": repr(e)
-        }
+        return {"ts": int(time.time()), "market_mode": "UNKNOWN", "top_picks": [], "error": repr(e)}
 
     rows = []
-    for coin in data:
-        try:
-            price = float(coin.get("priceUsd", 0))
-            p24 = float(coin.get("changePercent24Hr", 0))
-            vol = float(coin.get("volumeUsd24Hr", 0))
-        except:
-            continue
+    for item in data:
+        coin_info = item.get("CoinInfo", {}) or {}
+        raw = (item.get("RAW", {}) or {}).get("USD", {}) or {}
 
-        if vol < 1_000_000:
-            continue
+        symbol = coin_info.get("Name", "")
+        price = safe_float(raw.get("PRICE"))
+        p24 = safe_float(raw.get("CHANGEPCT24HOUR"))
+        vol24 = safe_float(raw.get("TOTALVOLUME24H"), 0.0) * price  # approx USD volume
+
         if price <= 0:
             continue
+        if vol24 < 1_000_000:
+            continue
 
-        score = score_coin(p24=p24, vol24_usdt=vol, spread=0.002)
+        score = score_coin(p24=p24, vol24_usdt=vol24, spread=0.002)
 
         rows.append({
-            "symbol": coin.get("symbol", ""),
+            "symbol": symbol,
             "price": round(price, 6),
             "chg24_pct": round(p24, 2),
-            "vol24_usdt": int(vol),
+            "vol24_usdt": int(vol24),
             "spread_pct": 0.2,
             "score": score,
             "plan": build_trade_plan(price)
@@ -87,11 +89,16 @@ def get_top_picks():
 
     rows.sort(key=lambda r: r["score"], reverse=True)
 
-    return {
-        "ts": int(time.time()),
-        "market_mode": "RISK-ON",
-        "top_picks": rows[:10]
-    }
+    # Market mode (rough): BTC 24h change from same payload if exists
+    mode = "NEUTRAL"
+    btc = next((x for x in rows if x["symbol"] == "BTC"), None)
+    if btc:
+        if btc["chg24_pct"] > 1.0:
+            mode = "RISK-ON"
+        elif btc["chg24_pct"] < -1.0:
+            mode = "RISK-OFF"
+
+    return {"ts": int(time.time()), "market_mode": mode, "top_picks": rows[:10]}
 @app.get("/api/top", response_class=JSONResponse)
 def api_top():
     return get_top_picks()
